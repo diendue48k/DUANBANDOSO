@@ -1,10 +1,15 @@
-
 import { Site, SiteDetail, Person, PersonDetail, RouteData, AddressSearchResult, Event, Media } from '../types';
 
 const API_BASE_URL = 'https://web-production-c3ccb.up.railway.app';
+
+// Order by typical speed/reliability: 
+// 1. corsproxy.io (Direct pipe, usually fastest)
+// 2. codetabs (Reliable)
+// 3. allorigins (JSON wrapped, slower but very stable)
 const PROXY_LIST = [
-    (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-    (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`
+    (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    (url: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    (url: string) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`
 ];
 
 // --- Raw Database Interfaces (Matching model.py & API JSON) ---
@@ -70,13 +75,14 @@ interface RawDimPerson {
 let globalSiteCache: Site[] = [];
 let globalPersonCache: Person[] = [];
 
-// Reference Data Store (Loaded once to avoid repeated large fetches)
+// Reference Data Store
 interface ReferenceData {
     mediaMap: Map<string, RawDimMedia>;
     eventMediaRelations: RawFactEventMedia[];
     personEventRelations: RawFactPersonEvent[];
     personMap: Map<string, RawDimPerson>;
     isLoaded: boolean;
+    isLoading: boolean;
 }
 
 const refData: ReferenceData = {
@@ -84,7 +90,40 @@ const refData: ReferenceData = {
     eventMediaRelations: [],
     personEventRelations: [],
     personMap: new Map(),
-    isLoaded: false
+    isLoaded: false,
+    isLoading: false
+};
+
+// --- Local Storage Cache Helpers ---
+const CACHE_PREFIX = 'dn_history_map_';
+const CACHE_TTL = 1000 * 60 * 60 * 24; // 24 hours
+
+const getLocalCache = <T>(key: string): T | null => {
+    try {
+        const item = localStorage.getItem(CACHE_PREFIX + key);
+        if (!item) return null;
+        
+        const { timestamp, data } = JSON.parse(item);
+        if (Date.now() - timestamp > CACHE_TTL) {
+            localStorage.removeItem(CACHE_PREFIX + key);
+            return null;
+        }
+        return data as T;
+    } catch (e) {
+        return null;
+    }
+};
+
+const setLocalCache = (key: string, data: any) => {
+    try {
+        localStorage.setItem(CACHE_PREFIX + key, JSON.stringify({
+            timestamp: Date.now(),
+            data
+        }));
+    } catch (e) {
+        // Quota exceeded or similar
+        console.warn("Failed to save to local cache", e);
+    }
 };
 
 
@@ -93,13 +132,35 @@ const refData: ReferenceData = {
 const MAX_RETRIES = 1; 
 const INITIAL_BACKOFF = 1000;
 
-async function fetchWithRetry(url: string, retries = MAX_RETRIES): Promise<any> {
+// Polyfill for Promise.any to avoid TS errors if lib is not es2021
+const promiseAny = async <T>(promises: Promise<T>[]): Promise<T> => {
+    return new Promise((resolve, reject) => {
+        let errors: any[] = [];
+        let pending = promises.length;
+        if (pending === 0) {
+            reject(new Error("No promises to execute"));
+            return;
+        }
+        
+        promises.forEach(p => {
+            Promise.resolve(p).then(resolve).catch(e => {
+                errors.push(e);
+                pending--;
+                if (pending === 0) {
+                    reject(new Error("All promises rejected")); 
+                }
+            });
+        });
+    });
+};
+
+async function fetchWithRetry(url: string, retries = MAX_RETRIES, timeoutMs = 15000): Promise<any> {
     let attempt = 0;
     while (attempt <= retries) {
         attempt++;
         try {
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 20000); 
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs); 
 
             const response = await fetch(url, {
                 method: 'GET',
@@ -108,7 +169,6 @@ async function fetchWithRetry(url: string, retries = MAX_RETRIES): Promise<any> 
             clearTimeout(timeoutId);
 
             if (!response.ok) {
-                // 404 is valid for "No Data Found" (e.g. no events for a location)
                 if (response.status === 404) return { count: 0, data: [] };
                 throw new Error(`HTTP ${response.status}`);
             }
@@ -127,27 +187,37 @@ async function fetchWithRetry(url: string, retries = MAX_RETRIES): Promise<any> 
 async function fetchFromApi(endpoint: string, options?: { silent?: boolean }): Promise<any> {
     const directUrl = `${API_BASE_URL}${endpoint}`;
     
-    // 1. Try Direct Fetch
-    try {
-        return await fetchWithRetry(directUrl);
-    } catch (directError) {
-        if (!options?.silent) {
-            console.warn(`[API] Direct fetch failed for ${endpoint}, switching to proxies...`);
-        }
-        
-        // 2. Try Proxies sequentially
-        for (const createProxyUrl of PROXY_LIST) {
-            try {
-                const proxyUrl = createProxyUrl(directUrl);
-                const proxyUrlWithCacheBust = `${proxyUrl}${proxyUrl.includes('?') ? '&' : '?'}t=${Date.now()}`;
-                return await fetchWithRetry(proxyUrlWithCacheBust);
-            } catch (proxyError) {
-                // Continue
+    // 1. Race: Try Direct vs All Proxies concurrently to see which one wins first
+    // This is faster than trying them sequentially.
+    
+    const strategies = [
+        () => fetchWithRetry(directUrl, 0, 8000), // Direct, short timeout
+        ...PROXY_LIST.map(createUrl => () => {
+            const url = createUrl(directUrl);
+            // AllOrigins returns a wrapper { contents: "string_data", status: ... }
+            if (url.includes('allorigins')) {
+                return fetchWithRetry(url, 0, 20000).then(json => {
+                    if (json && json.contents) {
+                        try {
+                            return JSON.parse(json.contents);
+                        } catch {
+                            return json.contents; // fallback if string
+                        }
+                    }
+                    return json;
+                });
             }
-        }
+            return fetchWithRetry(url, 0, 20000);
+        })
+    ];
 
+    try {
+        // Use promiseAny to get the first successful response
+        const result = await promiseAny(strategies.map(fn => fn()));
+        return result;
+    } catch (aggregateError) {
         if (!options?.silent) {
-            console.warn(`[API] All fetch attempts failed for ${endpoint}`);
+            console.warn(`[API] All fetch strategies failed for ${endpoint}`, aggregateError);
         }
         return { count: 0, data: [] };
     }
@@ -156,66 +226,55 @@ async function fetchFromApi(endpoint: string, options?: { silent?: boolean }): P
 const extractData = <T>(response: any): T[] => {
     if (!response) return [];
     if (Array.isArray(response)) return response;
+    // Handle AllOrigins wrapper if it leaked through or standard API response
+    if (response.contents) {
+         try {
+             const inner = typeof response.contents === 'string' ? JSON.parse(response.contents) : response.contents;
+             return extractData(inner);
+         } catch { return []; }
+    }
     if (response.data && Array.isArray(response.data)) return response.data;
     return [];
 };
 
 // --- Reference Data Loader ---
 
-const ensureReferenceDataLoaded = async () => {
-    if (refData.isLoaded) return;
+export const ensureReferenceDataLoaded = async () => {
+    if (refData.isLoaded || refData.isLoading) return;
+    refData.isLoading = true;
 
-    console.log("[RefData] Starting load of reference data...");
+    console.log("[RefData] Starting background load of reference data...");
 
-    // Fetch in parallel but handle failures individually so one failure doesn't block others
-    const results = await Promise.allSettled([
-        fetchFromApi('/media'),            
-        fetchFromApi('/event-media'),      
-        fetchFromApi('/person-events'),    
-        fetchFromApi('/persons')           
-    ]);
+    try {
+        // Fetch in parallel
+        const [mediaRes, eventMediaRes, personEventRes, personsRes] = await Promise.all([
+            fetchFromApi('/media', { silent: true }),            
+            fetchFromApi('/event-media', { silent: true }),      
+            fetchFromApi('/person-events', { silent: true }),    
+            fetchFromApi('/persons', { silent: true })           
+        ]);
 
-    const [mediaRes, eventMediaRes, personEventRes, personsRes] = results;
-
-    // Process Media
-    if (mediaRes.status === 'fulfilled') {
-        const allMedia = extractData<RawDimMedia>(mediaRes.value);
+        // Process Media
+        const allMedia = extractData<RawDimMedia>(mediaRes);
         refData.mediaMap = new Map(allMedia.map(m => [String(m.media_key).trim(), m]));
-        console.log(`[RefData] Loaded ${allMedia.length} media items.`);
-    } else {
-        console.error("[RefData] Failed to load Media:", mediaRes.reason);
-    }
 
-    // Process Event-Media Relations
-    if (eventMediaRes.status === 'fulfilled') {
-        const allEventMedia = extractData<RawFactEventMedia>(eventMediaRes.value);
-        refData.eventMediaRelations = allEventMedia;
-        console.log(`[RefData] Loaded ${allEventMedia.length} event-media links.`);
-    } else {
-        console.error("[RefData] Failed to load Event-Media relations:", eventMediaRes.reason);
-    }
+        // Process Event-Media Relations
+        refData.eventMediaRelations = extractData<RawFactEventMedia>(eventMediaRes);
 
-    // Process Person-Event Relations
-    if (personEventRes.status === 'fulfilled') {
-        const allPersonEvents = extractData<RawFactPersonEvent>(personEventRes.value);
-        refData.personEventRelations = allPersonEvents;
-        console.log(`[RefData] Loaded ${allPersonEvents.length} person-event links.`);
-    } else {
-        console.error("[RefData] Failed to load Person-Event relations:", personEventRes.reason);
-    }
+        // Process Person-Event Relations
+        refData.personEventRelations = extractData<RawFactPersonEvent>(personEventRes);
 
-    // Process Persons
-    if (personsRes.status === 'fulfilled') {
-        const allPersons = extractData<RawDimPerson>(personsRes.value);
+        // Process Persons (for mapping in events)
+        const allPersons = extractData<RawDimPerson>(personsRes);
         refData.personMap = new Map(allPersons.map(p => [String(p.person_key).trim(), p]));
-        console.log(`[RefData] Loaded ${allPersons.length} persons.`);
-    } else {
-         console.error("[RefData] Failed to load Persons:", personsRes.reason);
-    }
 
-    // Mark as loaded if we got at least *some* data, otherwise we might retry next time
-    if (refData.mediaMap.size > 0 || refData.eventMediaRelations.length > 0) {
         refData.isLoaded = true;
+        console.log("[RefData] Background load complete.");
+
+    } catch (e) {
+        console.error("[RefData] Background load failed (will retry on demand):", e);
+    } finally {
+        refData.isLoading = false;
     }
 };
 
@@ -316,14 +375,21 @@ const hydrateEvents = (rawEvents: RawFactEvent[]): Event[] => {
 export const fetchSites = async (): Promise<Site[]> => {
     const mappedSites: Site[] = [];
     const seenIds = new Set<string>();
+    
+    // 1. Try Local Cache First (Instant Load)
+    const cachedSites = getLocalCache<Site[]>('sites');
+    if (cachedSites) {
+        console.log("[Cache] Loaded sites from local storage");
+        globalSiteCache = cachedSites;
+        // Background update check could go here, but for now we trust cache for speed
+        // If no cache, we fetch.
+        return cachedSites; 
+    }
 
     try {
-        const [locationsResponse, citiesResponse] = await Promise.all([
-            fetchFromApi('/locations'),
-            fetchFromApi('/cities')
-        ]);
-
+        const locationsResponse = await fetchFromApi('/locations');
         const locationsData = extractData<RawDimLocation>(locationsResponse);
+        
         if (locationsData.length > 0) {
             for (const item of locationsData) {
                 const site = mapSite(item);
@@ -333,20 +399,11 @@ export const fetchSites = async (): Promise<Site[]> => {
                 }
             }
         }
-
-        const citiesData = extractData<RawCity>(citiesResponse);
-        if (citiesData.length > 0) {
-            for (const item of citiesData) {
-                if (!seenIds.has(String(item.city_id))) {
-                    const citySite = mapSite(item);
-                    if (citySite.latitude && citySite.longitude) {
-                        mappedSites.push(citySite);
-                    }
-                }
-            }
-        }
         
-        globalSiteCache = mappedSites;
+        if (mappedSites.length > 0) {
+            globalSiteCache = mappedSites;
+            setLocalCache('sites', mappedSites);
+        }
         return mappedSites;
 
     } catch (e) {
@@ -356,11 +413,23 @@ export const fetchSites = async (): Promise<Site[]> => {
 };
 
 export const fetchPersons = async (): Promise<Person[]> => {
+    // 1. Try Local Cache First
+    const cachedPersons = getLocalCache<Person[]>('persons');
+    if (cachedPersons) {
+        console.log("[Cache] Loaded persons from local storage");
+        globalPersonCache = cachedPersons;
+        return cachedPersons;
+    }
+
     try {
         const response = await fetchFromApi('/persons');
         const data = extractData<RawDimPerson>(response);
         const mapped = data.map(mapPerson);
-        globalPersonCache = mapped;
+        
+        if (mapped.length > 0) {
+            globalPersonCache = mapped;
+            setLocalCache('persons', mapped);
+        }
         return mapped;
     } catch (e) {
         console.error("Error in fetchPersons:", e);
@@ -381,13 +450,15 @@ export const fetchSiteDetail = async (siteId: string | number): Promise<SiteDeta
     if (!siteInfo) return null;
 
     try {
-        // 2. Fetch specific events for this site from the backend
-        // Your API has /events/location/{id} which filters efficiently on the server
-        const eventsRes = await fetchFromApi(`/events/location/${siteId}`, { silent: true });
-        const siteEventsRaw = extractData<RawFactEvent>(eventsRes);
+        // 2. Start fetching events
+        const eventsPromise = fetchFromApi(`/events/location/${siteId}`, { silent: true });
+        
+        // 3. Ensure reference data is loaded (might already be running in bg)
+        const refPromise = ensureReferenceDataLoaded();
 
-        // 3. Ensure reference data (Media, Persons) is loaded for joining
-        await ensureReferenceDataLoaded();
+        const [eventsRes] = await Promise.all([eventsPromise, refPromise]);
+        
+        const siteEventsRaw = extractData<RawFactEvent>(eventsRes);
 
         // 4. Hydrate events with client-side joins
         const hydratedEvents = hydrateEvents(siteEventsRaw);
